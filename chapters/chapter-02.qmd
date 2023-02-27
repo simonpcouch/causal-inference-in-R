@@ -143,7 +143,7 @@ The distribution of malaria risk appears to be quite different by net usage.
 #|   A density plot of malaria risk for those who did and did not use nets.
 #|   The risk of malaria is lower for those who use nets.
 library(tidyverse)
-library(parsnip)
+library(tidymodels)
 library(causalworkshop)
 
 net_data <- net_data %>% mutate(net = as.factor(net))
@@ -383,6 +383,35 @@ The propensity score model includes the exposure---net use---as the dependent va
 ::: callout-tip
 ## Modeling the functional form
 
+```{r augment-resamples}
+#| include: false
+
+# a function that takes in a resample fit object and outputs a modified
+# version of that object where the training data underlying each rsplit
+# is augmented with predictions and propensity weights for
+# each element of the analysis set. this serves as the "bridge" between
+# two calls to `fit_resamples()` (or `tune_*()`) in a causal workflow, the
+# first being for the propensity model and the second for the outcome model.
+# `tune_results` must have been executed with option `extract = identity`.
+augment_resamples <- function(tune_results, resamples, wt_fn) {
+  collect_extracts(tune_results) %>%
+  right_join(resamples, by = "id") %>%
+  rowwise() %>%
+  mutate(
+    res = list(
+      analysis(splits) %>%
+      bind_cols(., predict(.extracts, ., type = "prob")) %>%
+      mutate(wts = importance_weights(wt_fn(.pred_TRUE, net, .treated = "TRUE"))) %>%
+      filter(!duplicated(id)) %>%
+      right_join(splits[["data"]], by = "id", suffix = c(".x", "")) %>%
+      arrange(id)
+    ),
+    splits = list(assign_in(splits, "data", res))
+  ) %>%
+  {manual_rset(splits = .$splits, ids = .$id)}
+}
+```
+
 Generally speaking, we want to lean on domain expertise and good modeling practices to fit the propensity score model.
 For instance, we may want to allow continuous confounders to be non-linear using splines, or we may want to add essential interactions between confounders.
 Because these are simulated data, we know we don't need these extra parameters (so we'll skip them), but in practice, you often do.
@@ -392,11 +421,13 @@ We'll discuss this more in @sec-using-ps.
 The propensity score model is a logistic regression model with the formula `net ~ income + health + temperature`, which predicts the probability of bed net usage based on the confounders income, health, and temperature.
 
 ```{r}
-propensity_model <- logistic_reg() %>%
-  fit(
-    net ~ income + health + temperature,
-    data = net_data
-  )
+propensity_wf <- workflow(
+  net ~ income + health + temperature,
+  logistic_reg()
+)
+
+propensity_model <- propensity_wf %>%
+  fit(data = net_data)
 
 # the first six propensity scores
 head(predict(propensity_model, net_data))
@@ -541,24 +572,25 @@ We're now ready to use the ATE weights to (attempt to) account for confounding i
 Fitting such a model is pleasantly simple in this case: we fit the same model as before but with `weights = wts`, which will incorporate the inverse probability weights.
 
 ```{r}
-linear_reg() %>%
+outcome_wf <- workflow(
+  malaria_risk ~ net,
+  linear_reg()
+)
+
+outcome_model <- outcome_wf %>%
+  add_case_weights(wts) %>%
   fit(
-    malaria_risk ~ net, 
-    data = net_data_wts, 
-    case_weights = importance_weights(net_data_wts$wts)
-  ) |>
+    data = net_data_wts %>% mutate(wts = importance_weights(wts))
+  )
+  
+outcome_model %>%
   tidy(conf.int = TRUE)
 ```
 
 ```{r}
 #| include = FALSE
-estimates <- linear_reg() %>%
-  fit(
-    malaria_risk ~ net, 
-    data = net_data_wts, 
-    case_weights = importance_weights(net_data_wts$wts)
-  ) |>
-  tidy(conf.int = TRUE) |>
+estimates <- outcome_model |>
+  tidy(conf.int = TRUE) %>%
   filter(term == "netTRUE") |>
   select(estimate, starts_with("conf")) |>
   mutate(across(everything(), \(x) round(x, digits = 1)))
@@ -612,56 +644,7 @@ To bootstrap for *R* samples, we:
 We then end up with a distribution of `estimate`s, with which we can calculate population statistics, such as point estimates, standard errors, and confidence intervals.
 :::
 
-Because the bootstrap is so flexible, we need to think carefully about the sources of uncertainty in the statistic we're calculating.
-It might be tempting to write a function like this to fit the statistic we're interested in (the point estimate for `netTRUE`):
-
-```{r}
-#| eval = FALSE
-library(rsample)
-
-fit_ipw_not_quite_rightly <- function(split, ...) {
-  # get bootstrapped data sample with `rsample::analysis()`
-  .df <- analysis(split)
-
-  # fit ipw model
-  linear_reg() %>%
-    fit(malaria_risk ~ net, data = .df, case_weights = .df$wts) |>
-    tidy()
-}
-```
-
-However, this function won't give us the correct confidence intervals because it treats the inverse probability weights as fixed values.
-They're not, of course; we just estimated them using logistic regression!
-We need to account for this uncertainty by bootstrapping the *entire modeling process*.
-For every bootstrap sample, we need to fit the propensity score model, calculate the inverse probability weights, then fit the weighted outcome model.
-
-```{r}
-library(rsample)
-
-fit_ipw <- function(split, ...) {
-  # get bootstrapped data sample with `rsample::analysis()`
-  .df <- analysis(split)
-
-  # fit propensity score model
-  propensity_model <- logistic_reg() %>%
-    fit(
-      net ~ income + health + temperature,
-      data = .df
-    )
-
-  # calculate inverse probability weights
-  .df <- propensity_model |>
-    augment(.df) |>
-    mutate(wts = importance_weights(wt_ate(.pred_TRUE, net, .treated = "TRUE")))
-
-  # fit correctly bootstrapped ipw model
-  linear_reg() %>%
-    fit(malaria_risk ~ net, data = .df, case_weights = .df$wts) |>
-    tidy()
-}
-```
-
-Now that we know precisely how to calculate the estimate for each iteration let's create the bootstrapped dataset with rsample's `bootstraps()` function.
+Let's create the bootstrapped dataset with rsample's `bootstraps()` function.
 The `times` argument determines how many bootstrapped datasets to create; we'll do 1,000.
 
 ```{r}
@@ -671,35 +654,45 @@ bootstrapped_net_data <- bootstraps(
   # required to calculate CIs later
   apparent = TRUE
 )
-
-bootstrapped_net_data
 ```
 
 The result is a nested data frame: each `splits` object contains metadata that rsample uses to subset the bootstrap samples for each of the 1,000 samples.
-Next, we'll run `fit_ipw()` 1,000 times to create a distribution for `estimate`.
-At its heart, the calculation we're doing is
 
-``` r
-fit_ipw(bootstrapped_net_data$splits[[n]])
-```
-
-Where *n* is one of 1,000.
-We'll use purrr's `map()` function to iterate across each `split` object.
+Because the bootstrap is so flexible, we need to think carefully about the sources of uncertainty in the statistic we're calculating.
+It might be tempting to write a function like this to fit the statistic we're interested in (the point estimate for `netTRUE`):
 
 ```{r}
-ipw_results <- bootstrapped_net_data |>
-  mutate(boot_fits = map(splits, fit_ipw))
+#| eval = FALSE
 
-ipw_results
+fit_ipw_not_quite_rightly <-
+  fit_resamples(
+    outcome_wf,
+    resamples = bootstrapped_net_data,
+    control = control_resamples(extract = tidy)
+  )
 ```
 
-The result is another nested data frame with a new column, `boot_fits`.
-Each element of `boot_fits` is the result of the IPW for the bootstrapped dataset.
-For example, in the first bootstrapped data set, the IPW results were:
+However, this function won't give us the correct confidence intervals because it treats the inverse probability weights as fixed values.
+They're not, of course; we just estimated them using logistic regression!
+We need to account for this uncertainty by bootstrapping the *entire modeling process*.
+For every bootstrap sample, we need to fit the propensity score model, calculate the inverse probability weights, then fit the weighted outcome model.
 
 ```{r}
-ipw_results$boot_fits[[1]]
+ipw_results <-
+  fit_resamples(
+    propensity_wf,
+    resamples = bootstrapped_net_data,
+    control = control_resamples(extract = identity)
+  ) %>%
+  augment_resamples(bootstrapped_net_data, wt_ate) %>%
+  fit_resamples(
+    outcome_wf %>% add_case_weights(wts),
+    resamples = .,
+    control = control_resamples(extract = tidy)
+  ) %>%
+  collect_extracts()
 ```
+
 
 Now we have a distribution of estimates:
 
@@ -709,16 +702,8 @@ Now we have a distribution of estimates:
 #| warning: false
 #| fig.cap: >
 #|   "A histogram of 1,000 bootstrapped estimates of the effect of net use on malaria risk. The spread of these estimates accounts for the dependency and uncertainty in the use of IPW weights."
-ipw_results |>
-  mutate(
-    estimate = map_dbl(
-      boot_fits,
-      # pull the `estimate` for `netTRUE` for each fit
-      \(.fit) .fit |>
-        filter(term == "netTRUE") |>
-        pull(estimate)
-    )
-  ) |>
+bind_rows(ipw_results$.extracts) |>
+  filter(term == "netTRUE") |>
   ggplot(aes(estimate)) +
   geom_histogram(fill = "#D55E00FF", color = "white", alpha = 0.8)
 ```
@@ -727,8 +712,9 @@ ipw_results |>
 
 ```{r}
 boot_estimate <- ipw_results |>
+  structure(class = class(bootstrapped_net_data)) %>%
   # calculate T-statistic-based CIs
-  int_t(boot_fits) |>
+  int_t(.extracts) |>
   filter(term == "netTRUE")
 
 boot_estimate
