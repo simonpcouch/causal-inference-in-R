@@ -23,6 +23,7 @@ Imports:
     halfmoon (>= 0.0.0.9000),
     here,
     MatchIt,
+    parsnip,
     propensity (>= 0.0.0.9000),
     ragg,
     rsample (>= 0.0.5),

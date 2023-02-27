@@ -104,7 +104,7 @@ We'll use simulated data, `net_data`, from the {causalworkshop} package (TODO: m
 
 `net` and `net_num`
 
-:   a binary variable indicating if the participant used a net (1) or didn't use a net (0)
+:   a binary variable indicating if the participant used a net (1) or didn't use a net (0), as a factor
 
 `malaria_risk`
 
@@ -143,7 +143,12 @@ The distribution of malaria risk appears to be quite different by net usage.
 #|   A density plot of malaria risk for those who did and did not use nets.
 #|   The risk of malaria is lower for those who use nets.
 library(tidyverse)
+library(parsnip)
 library(causalworkshop)
+
+net_data <- net_data %>% mutate(net = as.factor(net))
+net_data_full <- net_data_full %>% mutate(net = as.factor(net))
+
 net_data |>
   ggplot(aes(malaria_risk, fill = net)) +
   geom_density(color = NA, alpha = .8)
@@ -170,8 +175,9 @@ And that's what we see with simple linear regression, as well, as we would expec
 
 ```{r}
 library(broom)
-net_data |>
-  lm(malaria_risk ~ net, data = _) |>
+
+linear_reg() |>
+  fit(malaria_risk ~ net, data = net_data) |>
   tidy()
 ```
 
@@ -386,14 +392,14 @@ We'll discuss this more in @sec-using-ps.
 The propensity score model is a logistic regression model with the formula `net ~ income + health + temperature`, which predicts the probability of bed net usage based on the confounders income, health, and temperature.
 
 ```{r}
-propensity_model <- glm(
-  net ~ income + health + temperature,
-  data = net_data,
-  family = binomial()
-)
+propensity_model <- logistic_reg() %>%
+  fit(
+    net ~ income + health + temperature,
+    data = net_data
+  )
 
 # the first six propensity scores
-head(predict(propensity_model, type = "response"))
+head(predict(propensity_model, net_data))
 ```
 
 We can use propensity scores to control for confounding in various ways.
@@ -412,10 +418,13 @@ In other words, if you used a bed net, the ATE weight is the probability that yo
 library(broom)
 library(propensity)
 net_data_wts <- propensity_model |>
-  augment(newdata = net_data, type.predict = "response") |>
+  augment(net_data) |>
   # .fitted is the value predicted by the model
   # for a given observation
-  mutate(wts = wt_ate(.fitted, net))
+  mutate(
+    .fitted = .pred_TRUE,
+    wts = wt_ate(.fitted, net, .treated = "TRUE")
+  )
 
 net_data_wts |>
   select(net, .fitted, wts) |>
@@ -532,19 +541,27 @@ We're now ready to use the ATE weights to (attempt to) account for confounding i
 Fitting such a model is pleasantly simple in this case: we fit the same model as before but with `weights = wts`, which will incorporate the inverse probability weights.
 
 ```{r}
-net_data_wts |>
-  lm(malaria_risk ~ net, data = _, weights = wts) |>
+linear_reg() %>%
+  fit(
+    malaria_risk ~ net, 
+    data = net_data_wts, 
+    case_weights = importance_weights(net_data_wts$wts)
+  ) |>
   tidy(conf.int = TRUE)
 ```
 
 ```{r}
 #| include = FALSE
-estimates <- net_data_wts |>
-  lm(malaria_risk ~ net, data = _, weights = wts) |>
+estimates <- linear_reg() %>%
+  fit(
+    malaria_risk ~ net, 
+    data = net_data_wts, 
+    case_weights = importance_weights(net_data_wts$wts)
+  ) |>
   tidy(conf.int = TRUE) |>
   filter(term == "netTRUE") |>
   select(estimate, starts_with("conf")) |>
-  mutate(across(everything(), round, digits = 1))
+  mutate(across(everything(), \(x) round(x, digits = 1)))
 ```
 
 The estimate for the average treatment effect is `r est_ci(estimates)`.
@@ -607,7 +624,8 @@ fit_ipw_not_quite_rightly <- function(split, ...) {
   .df <- analysis(split)
 
   # fit ipw model
-  lm(malaria_risk ~ net, data = .df, weights = wts) |>
+  linear_reg() %>%
+    fit(malaria_risk ~ net, data = .df, case_weights = .df$wts) |>
     tidy()
 }
 ```
@@ -625,19 +643,20 @@ fit_ipw <- function(split, ...) {
   .df <- analysis(split)
 
   # fit propensity score model
-  propensity_model <- glm(
-    net ~ income + health + temperature,
-    data = .df,
-    family = binomial()
-  )
+  propensity_model <- logistic_reg() %>%
+    fit(
+      net ~ income + health + temperature,
+      data = .df
+    )
 
   # calculate inverse probability weights
   .df <- propensity_model |>
-    augment(type.predict = "response", data = .df) |>
-    mutate(wts = wt_ate(.fitted, net))
+    augment(.df) |>
+    mutate(wts = importance_weights(wt_ate(.pred_TRUE, net, .treated = "TRUE")))
 
   # fit correctly bootstrapped ipw model
-  lm(malaria_risk ~ net, data = .df, weights = wts) |>
+  linear_reg() %>%
+    fit(malaria_risk ~ net, data = .df, case_weights = .df$wts) |>
     tidy()
 }
 ```
@@ -866,19 +885,20 @@ fit_ipw_full <- function(split, ...) {
   .df <- analysis(split)
 
   # fit propensity score model
-  propensity_model <- glm(
-    net ~ income + health + temperature + genetic_resistance,
-    data = .df,
-    family = binomial()
-  )
+  propensity_model <- logistic_reg() %>%
+    fit(
+      net ~ income + health + temperature + genetic_resistance,
+      data = .df
+    )
 
   # calculate inverse probability weights
   .df <- propensity_model |>
-    augment(type.predict = "response", data = .df) |>
-    mutate(wts = wt_ate(.fitted, net))
+    augment(.df) |>
+    mutate(wts = importance_weights(wt_ate(.pred_TRUE, net, .treated = "TRUE")))
 
   # fit correctly bootstrapped ipw model
-  lm(malaria_risk ~ net, data = .df, weights = wts) |>
+  linear_reg() %>%
+    fit(malaria_risk ~ net, data = .df, case_weights = .df$wts) |>
     tidy()
 }
 
